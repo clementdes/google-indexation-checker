@@ -1,17 +1,18 @@
 import streamlit as st
-import requests
 import pandas as pd
 import plotly.express as px
-from time import sleep
+import asyncio
+import aiohttp
+from concurrent.futures import ThreadPoolExecutor
 
-# Import des configurations depuis les fichiers annexes
+# Import des configurations
 from google_domains import DOMAIN_OPTIONS
 from google_languages import HL_OPTIONS
 from google_locations import GL_OPTIONS
 
-def check_indexation(url, api_key, gl, hl, google_domain):
+async def check_indexation_async(session, url, api_key, gl, hl, google_domain):
     """
-    Vérifie si une URL est indexée sur Google via l'API ScaleSerp
+    Version asynchrone de la vérification d'indexation
     """
     api_url = "https://api.scaleserp.com/search"
     params = {
@@ -24,23 +25,51 @@ def check_indexation(url, api_key, gl, hl, google_domain):
     }
     
     try:
-        response = requests.get(api_url, params=params)
-        data = response.json()
-        
-        is_indexed = len(data.get("organic_results", [])) > 0
-        title = data.get("organic_results", [{}])[0].get("title", "") if is_indexed else ""
-        
-        return {
-            "url": url,
-            "indexed": "Oui" if is_indexed else "Non",
-            "title": title
-        }
+        async with session.get(api_url, params=params) as response:
+            data = await response.json()
+            is_indexed = len(data.get("organic_results", [])) > 0
+            title = data.get("organic_results", [{}])[0].get("title", "") if is_indexed else ""
+            
+            return {
+                "url": url,
+                "indexed": "Oui" if is_indexed else "Non",
+                "title": title
+            }
     except Exception as e:
         return {
             "url": url,
             "indexed": "Erreur",
             "title": str(e)
         }
+
+async def process_urls_async(urls, api_key, gl, hl, google_domain, progress_bar, status_text):
+    """
+    Traite une liste d'URLs de manière asynchrone
+    """
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        chunk_size = 5  # Nombre de requêtes simultanées
+        
+        for i in range(0, len(urls), chunk_size):
+            chunk = urls[i:i + chunk_size]
+            chunk_tasks = [
+                check_indexation_async(session, url, api_key, gl, hl, google_domain)
+                for url in chunk
+            ]
+            
+            # Exécuter les requêtes du chunk en parallèle
+            chunk_results = await asyncio.gather(*chunk_tasks)
+            tasks.extend(chunk_results)
+            
+            # Mettre à jour la progression
+            progress = (i + len(chunk)) / len(urls)
+            progress_bar.progress(progress)
+            status_text.text(f"Traitement des URLs {i+1}-{min(i+chunk_size, len(urls))} sur {len(urls)}...")
+            
+            # Petite pause entre les chunks pour éviter de surcharger l'API
+            await asyncio.sleep(0.5)
+        
+        return tasks
 
 def main():
     # Configuration de la page
@@ -51,7 +80,6 @@ def main():
         st.header("Configuration")
         api_key = st.text_input("Clé API ScaleSerp", type="password")
         
-        # Sélection du pays
         selected_country = st.selectbox(
             "Localisation Google (gl)", 
             options=list(GL_OPTIONS.keys()),
@@ -59,7 +87,6 @@ def main():
         )
         gl = GL_OPTIONS[selected_country]
         
-        # Sélection de la langue d'interface
         selected_language = st.selectbox(
             "Langue d'interface (hl)", 
             options=list(HL_OPTIONS.keys()),
@@ -67,7 +94,6 @@ def main():
         )
         hl = HL_OPTIONS[selected_language]
         
-        # Sélection du domaine Google
         selected_domain = st.selectbox(
             "Domaine Google",
             options=list(DOMAIN_OPTIONS.keys()),
@@ -75,22 +101,18 @@ def main():
         )
         google_domain = DOMAIN_OPTIONS[selected_domain]
         
-        # Afficher les paramètres actuels
         st.divider()
         st.caption("Paramètres actuels :")
         st.code(f"gl={gl}&hl={hl}&google_domain={google_domain}")
 
-    # Contenu principal
     st.title("Vérificateur d'indexation Google")
 
-    # Zone de texte pour les URLs
     urls_input = st.text_area(
         "Entrez vos URLs (une par ligne)",
         height=200,
         help="Collez vos URLs ici, une par ligne"
     )
 
-    # Bouton pour lancer la vérification
     if st.button("Vérifier l'indexation"):
         if not api_key:
             st.error("Veuillez entrer votre clé API ScaleSerp")
@@ -102,27 +124,22 @@ def main():
             progress_bar = st.progress(0)
             status_text = st.empty()
             
-            results = []
-            for i, url in enumerate(urls):
-                progress = (i + 1) / len(urls)
-                progress_bar.progress(progress)
-                status_text.text(f"Vérification de {url}...")
-                
-                result = check_indexation(url, api_key, gl, hl, google_domain)
-                results.append(result)
-                
-                sleep(1)
+            # Exécuter le traitement asynchrone
+            with ThreadPoolExecutor() as executor:
+                loop = asyncio.new_event_loop()
+                results = loop.run_until_complete(
+                    process_urls_async(urls, api_key, gl, hl, google_domain, progress_bar, status_text)
+                )
             
-            # Créer un DataFrame avec les résultats
+            # Créer le DataFrame avec les résultats
             df = pd.DataFrame(results)
             
-            # Statistiques et visualisation
+            # Affichage des résultats (reste identique)
             st.header("Résultats")
             
             col1, col2 = st.columns([1, 2])
             
             with col1:
-                # Camembert
                 indexation_stats = df['indexed'].value_counts()
                 fig = px.pie(
                     values=indexation_stats.values,
@@ -132,7 +149,6 @@ def main():
                 )
                 st.plotly_chart(fig, use_container_width=True)
                 
-                # Statistiques numériques
                 total_urls = len(df)
                 indexed_count = len(df[df['indexed'] == 'Oui'])
                 non_indexed_count = len(df[df['indexed'] == 'Non'])
@@ -145,7 +161,6 @@ def main():
                     st.metric("Erreurs", f"{error_count} ({error_count/total_urls*100:.1f}%)")
             
             with col2:
-                # Tableaux des résultats
                 tab1, tab2, tab3 = st.tabs(["URLs indexées", "URLs non indexées", "Erreurs"])
                 
                 with tab1:
@@ -186,7 +201,6 @@ def main():
                     else:
                         st.info("Aucune erreur")
             
-            # Bouton de téléchargement
             st.divider()
             csv = df.to_csv(index=False)
             st.download_button(
